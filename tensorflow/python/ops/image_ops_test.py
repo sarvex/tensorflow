@@ -654,6 +654,58 @@ class ResizeImagesTest(test_util.TensorFlowTestCase):
         newshape = yshape.eval()
         self.assertAllEqual(single_shape, newshape)
 
+  def testTensorArguments(self):
+    img_shape = [1, 6, 4, 1]
+    single_shape = [6, 4, 1]
+    # This test is also conducted with int8, so 127 is the maximum
+    # value that can be used.
+    data = [127, 127, 64, 64,
+            127, 127, 64, 64,
+            64, 64, 127, 127,
+            64, 64, 127, 127,
+            50, 50, 100, 100,
+            50, 50, 100, 100]
+    target_height = array_ops.placeholder(dtypes.int32)
+    target_width = array_ops.placeholder(dtypes.int32)
+
+    img_np = np.array(data, dtype=np.uint8).reshape(img_shape)
+
+    for opt in self.OPTIONS:
+      with self.test_session() as sess:
+        image = constant_op.constant(img_np, shape=img_shape)
+        y = image_ops.resize_images(image, target_height, target_width, opt)
+        yshape = array_ops.shape(y)
+        resized, newshape = sess.run([y, yshape], {target_height: 6,
+                                                   target_width: 4})
+        self.assertAllEqual(img_shape, newshape)
+        self.assertAllClose(resized, img_np, atol=1e-5)
+
+    # Resizing with a single image must leave the shape unchanged also.
+    with self.test_session():
+      img_single = img_np.reshape(single_shape)
+      image = constant_op.constant(img_single, shape=single_shape)
+      y = image_ops.resize_images(image, target_height, target_width,
+                                  self.OPTIONS[0])
+      yshape = array_ops.shape(y)
+      newshape = yshape.eval(feed_dict={target_height: 6, target_width: 4})
+      self.assertAllEqual(single_shape, newshape)
+
+    # Incorrect shape.
+    with self.assertRaises(ValueError):
+      _ = image_ops.resize_images(
+          image, [12, 32], 4, image_ops.ResizeMethod.BILINEAR)
+    with self.assertRaises(ValueError):
+      _ = image_ops.resize_images(
+          image, 6, [12, 32], image_ops.ResizeMethod.BILINEAR)
+
+    # Incorrect dtypes.
+    with self.assertRaises(ValueError):
+      _ = image_ops.resize_images(
+          image, 6.0, 4, image_ops.ResizeMethod.BILINEAR)
+    with self.assertRaises(ValueError):
+      _ = image_ops.resize_images(
+          image, 6, 4.0, image_ops.ResizeMethod.BILINEAR)
+
   def testResizeDown(self):
     # This test is also conducted with int8, so 127 is the maximum
     # value that can be used.
@@ -1005,6 +1057,21 @@ class PngTest(test_util.TensorFlowTestCase):
       # Smooth ramps compress well, but not too well
       self.assertGreaterEqual(len(png0), 400)
       self.assertLessEqual(len(png0), 750)
+
+  def testSyntheticUint16(self):
+    with self.test_session() as sess:
+      # Encode it, then decode it
+      image0 = constant_op.constant(_SimpleColorRamp(), dtype=dtypes.uint16)
+      png0 = image_ops.encode_png(image0, compression=7)
+      image1 = image_ops.decode_png(png0, dtype=dtypes.uint16)
+      png0, image0, image1 = sess.run([png0, image0, image1])
+
+      # PNG is lossless
+      self.assertAllEqual(image0, image1)
+
+      # Smooth ramps compress well, but not too well
+      self.assertGreaterEqual(len(png0), 800)
+      self.assertLessEqual(len(png0), 1500)
 
   def testShape(self):
     with self.test_session():

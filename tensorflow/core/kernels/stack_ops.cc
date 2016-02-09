@@ -21,16 +21,16 @@ limitations under the License.
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/resource_mgr.h"
+#include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/mutex.h"
-#include "tensorflow/core/platform/port.h"
 #include "tensorflow/core/platform/thread_annotations.h"
-#include "tensorflow/core/public/tensor.h"
-#include "tensorflow/core/public/tensor_shape.h"
+#include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
 
@@ -136,6 +136,8 @@ class StackPushOp : public OpKernel {
     stack->Push(PersistentTensor(ctx->input(1)));
     ctx->set_output(0, ctx->input(1));
   }
+
+  bool IsExpensive() override { return false; }
 };
 
 REGISTER_KERNEL_BUILDER(Name("StackPush").Device(DEVICE_CPU), StackPushOp);
@@ -165,6 +167,8 @@ class StackPopOp : public OpKernel {
                                     "Calling Pop() when the stack is empty."));
     ctx->set_output(0, *value.AccessTensor(ctx));
   }
+
+  bool IsExpensive() override { return false; }
 };
 
 REGISTER_KERNEL_BUILDER(Name("StackPop").Device(DEVICE_CPU), StackPopOp);

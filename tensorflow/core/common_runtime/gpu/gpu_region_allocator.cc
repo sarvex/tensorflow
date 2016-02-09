@@ -15,7 +15,7 @@ limitations under the License.
 
 #include "tensorflow/core/common_runtime/gpu/gpu_region_allocator.h"
 
-#include "tensorflow/stream_executor/multi_platform_manager.h"
+#include <vector>
 #include "tensorflow/core/common_runtime/gpu/gpu_allocator_retry.h"
 #include "tensorflow/core/common_runtime/gpu/gpu_init.h"
 #include "tensorflow/core/lib/core/bits.h"
@@ -25,7 +25,8 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/mutex.h"
-#include "tensorflow/core/platform/port.h"
+#include "tensorflow/core/platform/stream_executor.h"
+#include "tensorflow/core/platform/types.h"
 
 // If true, the CUDA gpu manager checks that all allocated memory
 // through the GPU memory pool implementation has been freed.
@@ -170,7 +171,7 @@ bool GPURegionAllocator::ExpandPool(Pool* pool, size_t chunk_size,
                                     bool dump_log_on_failure) {
   VLOG(1) << "ExpandPool of " << chunk_size << " from " << pool->num_chunks
           << " current members";
-  DCHECK_NE(0, chunk_size);
+  DCHECK_NE(size_t{0}, chunk_size);
   // If chunk_size is < 4096, double the pool size.  Otherwise
   // just increase by one.
   int num_chunks = pool->num_chunks;

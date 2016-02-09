@@ -16,6 +16,7 @@ limitations under the License.
 #include "tensorflow/core/framework/op_kernel.h"
 
 #include <unordered_map>
+#include <vector>
 
 #include "tensorflow/core/framework/attr_value_util.h"
 #include "tensorflow/core/framework/node_def_util.h"
@@ -29,7 +30,7 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/mutex.h"
-#include "tensorflow/core/platform/port.h"
+#include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
 
@@ -93,8 +94,12 @@ OpKernel::OpKernel(OpKernelConstruction* context)
     : def_(context->def()),
       input_types_(context->input_types().begin(),
                    context->input_types().end()),
+      input_memory_types_(context->input_memory_types().begin(),
+                          context->input_memory_types().end()),
       output_types_(context->output_types().begin(),
                     context->output_types().end()),
+      output_memory_types_(context->output_memory_types().begin(),
+                           context->output_memory_types().end()),
       graph_def_version_(context->graph_def_version()),
       is_internal_(StringPiece(type_string()).starts_with("_")),
       input_name_map_(context->num_inputs()),
@@ -102,28 +107,6 @@ OpKernel::OpKernel(OpKernelConstruction* context)
   OP_REQUIRES_OK(context,
                  NameRangesForNode(def_, context->op_def(), &input_name_map_,
                                    &output_name_map_));
-
-  // By default, the input and output memory types are always in device memory,
-  // but can be overridden by individual implementations of OpKernels in their
-  // constructor.
-  input_memory_types_ = MemoryTypeVector(input_types_.size(), DEVICE_MEMORY);
-  output_memory_types_ = MemoryTypeVector(output_types_.size(), DEVICE_MEMORY);
-  // TODO(yuanbyu): For now we assume the memory types of function
-  // inputs/outputs to be DEVICE_MEMORY.
-  auto lib = context->function_library();
-  if (lib == nullptr || !lib->IsDefined(def_.op())) {
-    OP_REQUIRES_OK(context, MemoryTypesForNode(
-                                context->device_type(), def_, context->op_def(),
-                                input_name_map_, output_name_map_,
-                                &input_memory_types_, &output_memory_types_));
-    // Log all the uses of int32 on GPU.
-    // TODO(yunabyu): Remove once everyone transitions to HostMemory.
-    if (VLOG_IS_ON(2)) {
-      if (!CheckHostMemoryCompatibility(context->device_type(), this)) {
-        VLOG(2) << "Using int32 on GPU at node: " << SummarizeNodeDef(def());
-      }
-    }
-  }
 }
 
 Status OpKernel::InputRange(const string& input_name, int* start,
@@ -210,11 +193,13 @@ Status OpKernelConstruction::allocate_persistent(
 
 // OpKernelContext -----------------------------------------------------------
 
-OpKernelContext::OpKernelContext(const Params& params)
-    : params_(params), outputs_(params.op_kernel->output_types().size()) {
+OpKernelContext::OpKernelContext(Params* params)
+    : params_(params), outputs_(params_->op_kernel->output_types().size()) {
   Allocator* eigen_gpu_allocator = get_allocator(AllocatorAttributes());
-  eigen_gpu_device_ = params_.device->MakeGpuDevice(params_.op_device_context,
-                                                    eigen_gpu_allocator);
+  params_->ensure_eigen_gpu_device();
+  params_->device->ReinitializeGpuDevice(params_->eigen_gpu_device,
+                                         params_->op_device_context,
+                                         eigen_gpu_allocator);
 }
 
 OpKernelContext::~OpKernelContext() {
@@ -223,30 +208,29 @@ OpKernelContext::~OpKernelContext() {
       delete value.tensor;
     }
   }
-  delete eigen_gpu_device_;
 }
 
 Status OpKernelContext::input(const string& name, const Tensor** tensor) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->InputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->InputRange(name, &start, &stop));
   if (stop != start + 1) {
     return errors::InvalidArgument("OpKernel used list-valued input name '",
                                    name,
                                    "' when single-valued input was "
                                    "expected");
   }
-  if ((*params_.inputs)[start].is_ref()) {
+  if ((*params_->inputs)[start].is_ref()) {
     return errors::InvalidArgument("OpKernel used ref input name '", name,
                                    "' when immutable input was expected");
   }
-  *tensor = (*params_.inputs)[start].tensor;
+  *tensor = (*params_->inputs)[start].tensor;
   record_tensor_reference(**tensor);
   return Status::OK();
 }
 
 Status OpKernelContext::input_ref_mutex(const string& name, mutex** out_mutex) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->InputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->InputRange(name, &start, &stop));
   if (stop != start + 1) {
     return errors::InvalidArgument("OpKernel used list-valued input name '",
                                    name,
@@ -259,22 +243,22 @@ Status OpKernelContext::input_ref_mutex(const string& name, mutex** out_mutex) {
 Status OpKernelContext::mutable_input(const string& name, Tensor* tensor,
                                       bool lock_held) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->InputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->InputRange(name, &start, &stop));
   if (stop != start + 1) {
     return errors::InvalidArgument("OpKernel used list-valued input name '",
                                    name,
                                    "' when single-valued input was expected");
   }
-  if (!(*params_.inputs)[start].is_ref()) {
+  if (!(*params_->inputs)[start].is_ref()) {
     return errors::InvalidArgument("OpKernel used immutable input name '", name,
                                    "' when ref input was expected");
   }
   // return a copy of the Ref acquired while holding the mutex
   if (lock_held) {
-    *tensor = *(*params_.inputs)[start].tensor;
+    *tensor = *(*params_->inputs)[start].tensor;
   } else {
     mutex_lock l(*input_ref_mutex(start));
-    *tensor = *(*params_.inputs)[start].tensor;
+    *tensor = *(*params_->inputs)[start].tensor;
   }
   record_tensor_reference(*tensor);
   return Status::OK();
@@ -284,13 +268,13 @@ Status OpKernelContext::replace_ref_input(const string& name,
                                           const Tensor& tensor,
                                           bool lock_held) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->InputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->InputRange(name, &start, &stop));
   if (stop != start + 1) {
     return errors::InvalidArgument("OpKernel used list-valued input name '",
                                    name,
                                    "' when single-valued input was expected");
   }
-  if (!(*params_.inputs)[start].is_ref()) {
+  if (!(*params_->inputs)[start].is_ref()) {
     return errors::InvalidArgument("OpKernel used immutable input name '", name,
                                    "' when ref input was expected");
   }
@@ -300,7 +284,7 @@ Status OpKernelContext::replace_ref_input(const string& name,
 
 Status OpKernelContext::input_list(const string& name, OpInputList* list) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->InputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->InputRange(name, &start, &stop));
   *list = OpInputList(this, start, stop);
   return Status::OK();
 }
@@ -308,14 +292,14 @@ Status OpKernelContext::input_list(const string& name, OpInputList* list) {
 Status OpKernelContext::mutable_input_list(const string& name,
                                            OpMutableInputList* list) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->InputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->InputRange(name, &start, &stop));
   *list = OpMutableInputList(this, start, stop);
   return Status::OK();
 }
 
 Status OpKernelContext::output_list(const string& name, OpOutputList* list) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->OutputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->OutputRange(name, &start, &stop));
   *list = OpOutputList(this, start, stop);
   return Status::OK();
 }
@@ -324,7 +308,7 @@ Status OpKernelContext::allocate_output(const string& name,
                                         const TensorShape& shape,
                                         Tensor** tensor) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->OutputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->OutputRange(name, &start, &stop));
   if (stop != start + 1) {
     return errors::InvalidArgument("OpKernel used list-valued output name '",
                                    name,
@@ -339,7 +323,7 @@ Status OpKernelContext::allocate_output(const string& name,
                                         Tensor** tensor,
                                         AllocatorAttributes attr) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->OutputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->OutputRange(name, &start, &stop));
   if (stop != start + 1) {
     return errors::InvalidArgument("OpKernel used list-valued output name '",
                                    name,
@@ -351,7 +335,7 @@ Status OpKernelContext::allocate_output(const string& name,
 
 Status OpKernelContext::set_output(const string& name, const Tensor& tensor) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->OutputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->OutputRange(name, &start, &stop));
   if (stop != start + 1) {
     return errors::InvalidArgument("OpKernel used list-valued output name '",
                                    name,
@@ -365,7 +349,7 @@ Status OpKernelContext::set_output(const string& name, const Tensor& tensor) {
 Status OpKernelContext::set_output_ref(const string& name, mutex* mu,
                                        Tensor* tensor_for_ref) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->OutputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->OutputRange(name, &start, &stop));
   if (stop != start + 1) {
     return errors::InvalidArgument("OpKernel used list-valued output name '",
                                    name,
@@ -378,7 +362,7 @@ Status OpKernelContext::set_output_ref(const string& name, mutex* mu,
 
 Status OpKernelContext::mutable_output(const string& name, Tensor** tensor) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->OutputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->OutputRange(name, &start, &stop));
   if (stop != start + 1) {
     return errors::InvalidArgument("OpKernel used list-valued output name '",
                                    name,
@@ -391,7 +375,7 @@ Status OpKernelContext::mutable_output(const string& name, Tensor** tensor) {
 
 Status OpKernelContext::release_output(const string& name, TensorValue* value) {
   int start, stop;
-  TF_RETURN_IF_ERROR(params_.op_kernel->OutputRange(name, &start, &stop));
+  TF_RETURN_IF_ERROR(params_->op_kernel->OutputRange(name, &start, &stop));
   if (stop != start + 1) {
     return errors::InvalidArgument("OpKernel used list-valued output name '",
                                    name,
@@ -403,7 +387,7 @@ Status OpKernelContext::release_output(const string& name, TensorValue* value) {
 }
 
 bool OpKernelContext::ValidateInputsAreSameShape(OpKernel* op) {
-  const auto& inputs = *params_.inputs;
+  const auto& inputs = *params_->inputs;
   for (size_t i = 1; i < inputs.size(); ++i) {
     if (!inputs[0]->IsSameSize(*(inputs[i].tensor))) {
       SetStatus(errors::InvalidArgument(
@@ -420,10 +404,10 @@ bool OpKernelContext::ValidateInputsAreSameShape(OpKernel* op) {
 Status OpKernelContext::MatchSignature(const DataTypeSlice expected_inputs,
                                        const DataTypeSlice expected_outputs) {
   DataTypeVector inputs;
-  for (const TensorValue& t : *params_.inputs) {
+  for (const TensorValue& t : *params_->inputs) {
     inputs.push_back(t.is_ref() ? MakeRefType(t->dtype()) : t->dtype());
   }
-  DataTypeVector outputs = params_.op_kernel->output_types();
+  DataTypeVector outputs = params_->op_kernel->output_types();
   return MatchSignatureHelper(expected_inputs, expected_outputs, inputs,
                               outputs);
 }
@@ -638,10 +622,19 @@ Status CreateOpKernel(DeviceType device_type, DeviceBase* device,
     return s;
   }
 
+  // We are creating a kernel for an op registered in
+  // OpRegistry::Global(), we consult the kernel registry to decide
+  // the kernel's input and output memory types.
+  MemoryTypeVector input_memory_types;
+  MemoryTypeVector output_memory_types;
+  TF_RETURN_IF_ERROR(MemoryTypesForNode(*OpRegistry::Global(), device_type,
+                                        node_def, &input_memory_types,
+                                        &output_memory_types));
+
   // Everything needed for OpKernel construction.
-  OpKernelConstruction context(device_type, device, allocator, &node_def,
-                               op_def, flib, inputs, outputs, graph_def_version,
-                               &s);
+  OpKernelConstruction context(
+      device_type, device, allocator, &node_def, op_def, flib, inputs,
+      input_memory_types, outputs, output_memory_types, graph_def_version, &s);
   *kernel = (*registration->factory)(&context);
   if (!s.ok()) {
     delete *kernel;
@@ -709,16 +702,17 @@ Status MemoryTypesForNode(DeviceType device_type, const NodeDef& ndef,
   return status;
 }
 
-Status MemoryTypesForNode(const OpRegistryInterface* op_registry,
+Status MemoryTypesForNode(const OpRegistryInterface& op_registry,
                           DeviceType device_type, const NodeDef& ndef,
                           MemoryTypeVector* input_memory_types,
                           MemoryTypeVector* output_memory_types) {
   // Look up the Op registered for this op name.
   Status status;
-  const OpDef* op_def = op_registry->LookUp(ndef.op(), &status);
+  const OpDef* op_def = op_registry.LookUp(ndef.op(), &status);
   if (op_def == nullptr) return status;
 
-  NameRangeMap inputs, outputs;
+  NameRangeMap inputs;
+  NameRangeMap outputs;
   status = NameRangesForNode(ndef, *op_def, &inputs, &outputs);
   if (!status.ok()) return status;
 
@@ -740,11 +734,11 @@ bool FindArgInOp(const string& arg_name,
 
 }  // namespace
 
-Status ValidateKernelRegistrations(const OpRegistryInterface* op_registry) {
+Status ValidateKernelRegistrations(const OpRegistryInterface& op_registry) {
   Status unused_status;
   for (const auto& key_registration : *GlobalKernelRegistryTyped()) {
     const KernelDef& kernel_def(key_registration.second.def);
-    const OpDef* op_def = op_registry->LookUp(kernel_def.op(), &unused_status);
+    const OpDef* op_def = op_registry.LookUp(kernel_def.op(), &unused_status);
     if (op_def == nullptr) {
       // TODO(josh11b): Make this a hard error.
       LOG(ERROR) << "OpKernel ('" << kernel_def.ShortDebugString()

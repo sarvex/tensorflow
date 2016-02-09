@@ -24,11 +24,8 @@ limitations under the License.
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <vector>
 
-#include "tensorflow/stream_executor/cuda/cuda_activation.h"
-#include "tensorflow/stream_executor/multi_platform_manager.h"
-#include "tensorflow/stream_executor/stream.h"
-#include "tensorflow/stream_executor/stream_executor.h"
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/common_runtime/device_factory.h"
 #include "tensorflow/core/common_runtime/gpu/gpu_event_mgr.h"
@@ -41,18 +38,20 @@ limitations under the License.
 #include "tensorflow/core/framework/allocator.h"
 #include "tensorflow/core/framework/device_base.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/graph/types.h"
+#include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/gtl/stl_util.h"
 #include "tensorflow/core/lib/strings/numbers.h"
 #include "tensorflow/core/lib/strings/strcat.h"
+#include "tensorflow/core/platform/cuda.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
-#include "tensorflow/core/platform/port.h"
+#include "tensorflow/core/platform/stream_executor.h"
 #include "tensorflow/core/platform/tracing.h"
+#include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/public/session_options.h"
-#include "tensorflow/core/public/status.h"
-#include "tensorflow/core/public/tensor.h"
 #include "tensorflow/core/util/device_name_utils.h"
 
 namespace gpu = ::perftools::gputools;
@@ -74,9 +73,14 @@ namespace tensorflow {
 #if defined(__GCUDACC__) || defined(__GCUDACC_HOST__)
 class EigenAllocator : public ::Eigen::Allocator {
  public:
-  explicit EigenAllocator(gpu::Stream* stream, ::tensorflow::Allocator* alloc,
-                          EventMgr* em)
-      : stream_(stream), allocator_(alloc), em_(em) {}
+  EigenAllocator() {}
+
+  void Reinitialize(gpu::Stream* stream, ::tensorflow::Allocator* alloc,
+                    EventMgr* em) {
+    stream_ = stream;
+    allocator_ = alloc;
+    em_ = em;
+  }
 
   void* allocate(size_t num_bytes) const override {
     void* ret = allocator_->AllocateRaw(32 /* alignment */, num_bytes);
@@ -104,10 +108,12 @@ class EigenAllocator : public ::Eigen::Allocator {
 #else
 class EigenCudaStreamDevice : public ::Eigen::StreamInterface {
  public:
-  EigenCudaStreamDevice(const cudaStream_t* cuda_stream, int gpu_id,
-                        ::tensorflow::Allocator* alloc)
-      : stream_(cuda_stream), allocator_(alloc) {
-    Eigen::initializeDeviceProp();
+  EigenCudaStreamDevice() { Eigen::initializeDeviceProp(); }
+
+  void Reinitialize(const cudaStream_t* cuda_stream, int gpu_id,
+                    ::tensorflow::Allocator* alloc) {
+    stream_ = cuda_stream;
+    allocator_ = alloc;
     device_prop_ = &Eigen::m_deviceProperties[gpu_id];
   }
 
@@ -185,11 +191,31 @@ BaseGPUDevice::BaseGPUDevice(const SessionOptions& options, const string& name,
     auto stream = new gpu::Stream(executor);
     stream->Init();
     VLOG(2) << "Created stream[" << i << "] = " << stream;
-    streams_.push_back(stream);
-    device_contexts_.push_back(new GPUDeviceContext(i, stream));
+
+    auto host_to_device_stream = new gpu::Stream(executor);
+    host_to_device_stream->Init();
+    VLOG(2) << "Created host_to_device_stream[" << i
+            << "] = " << host_to_device_stream;
+
+    auto device_to_host_stream = new gpu::Stream(executor);
+    device_to_host_stream->Init();
+    VLOG(2) << "Created device_to_host_stream[" << i
+            << "] = " << device_to_host_stream;
+
+    auto device_to_device_stream = new gpu::Stream(executor);
+    device_to_device_stream->Init();
+    VLOG(2) << "Created device_to_device_stream[" << i
+            << "] = " << device_to_device_stream;
+
+    streams_.push_back({stream, host_to_device_stream, device_to_host_stream,
+                        device_to_device_stream});
+
+    device_contexts_.push_back(
+        new GPUDeviceContext(i, stream, host_to_device_stream,
+                             device_to_host_stream, device_to_device_stream));
   }
   gpu_device_info_ = new GpuDeviceInfo;
-  gpu_device_info_->stream = streams_[0];
+  gpu_device_info_->stream = streams_[0].compute;
   gpu_device_info_->default_context = device_contexts_[0];
   gpu_device_info_->event_mgr = em_.get();
   set_tensorflow_gpu_device_info(gpu_device_info_);
@@ -198,7 +224,19 @@ BaseGPUDevice::BaseGPUDevice(const SessionOptions& options, const string& name,
 BaseGPUDevice::~BaseGPUDevice() {
   delete gpu_device_info_;
   for (auto ctx : device_contexts_) ctx->Unref();
-  gtl::STLDeleteElements(&streams_);
+  for (auto& stream_group : streams_) {
+    delete stream_group.compute;
+    delete stream_group.host_to_device;
+    delete stream_group.device_to_host;
+    delete stream_group.device_to_device;
+  }
+}
+
+bool BaseGPUDevice::RequiresRecordingAccessedTensors() const {
+  // When there is no more than one stream, we release the tensor reference
+  // at the end of the kernel launch, instead of at the end of the kernel
+  // execution.
+  return streams_.size() > 1;
 }
 
 Status BaseGPUDevice::FillContextMap(const Graph* graph,
@@ -392,10 +430,11 @@ namespace {
 #if defined(__GCUDACC__) || defined(__GCUDACC_HOST__)
 class ConcretePerOpGpuDevice : public PerOpGpuDevice {
  public:
-  explicit ConcretePerOpGpuDevice(gpu::Stream* stream,
-                                  Allocator* base_allocator,
-                                  ::tensorflow::EventMgr* em)
-      : allocator_(stream, base_allocator, em), device_(stream, &allocator_) {}
+  void Reinitialize(gpu::Stream* stream, Allocator* base_allocator,
+                    ::tensorflow::EventMgr* em) {
+    allocator_.Reinitialize(stream, base_allocator, em);
+    device_.Reinitialize(stream, &allocator_);
+  }
 
   const Eigen::GpuDevice& device() const override { return device_; }
 
@@ -406,10 +445,12 @@ class ConcretePerOpGpuDevice : public PerOpGpuDevice {
 #else
 class ConcretePerOpGpuDevice : public PerOpGpuDevice {
  public:
-  explicit ConcretePerOpGpuDevice(const cudaStream_t* cuda_stream, int gpu_id,
-                                  Allocator* base_allocator)
-      : stream_device_(cuda_stream, gpu_id, base_allocator),
-        device_(&stream_device_) {}
+  ConcretePerOpGpuDevice() : device_(&stream_device_) {}
+
+  void Reinitialize(const cudaStream_t* cuda_stream, int gpu_id,
+                    Allocator* base_allocator) {
+    stream_device_.Reinitialize(cuda_stream, gpu_id, base_allocator);
+  }
 
   const Eigen::GpuDevice& device() const override { return device_; }
 
@@ -420,28 +461,37 @@ class ConcretePerOpGpuDevice : public PerOpGpuDevice {
 #endif
 }  // namespace
 
-const PerOpGpuDevice* BaseGPUDevice::NewDevice(int stream_id,
-                                               Allocator* allocator) {
+void BaseGPUDevice::ReinitializeDevice(PerOpGpuDevice* device, int stream_id,
+                                       Allocator* allocator) {
+  ConcretePerOpGpuDevice* concrete_device =
+      dynamic_cast<ConcretePerOpGpuDevice*>(device);
+  DCHECK(concrete_device);
 #if defined(__GCUDACC__) || defined(__GCUDACC_HOST__)
-  return new ConcretePerOpGpuDevice(streams_[stream_id], allocator, em_.get());
+  concrete_device->Reinitialize(streams_[stream_id].compute, allocator,
+                                em_.get());
 #else
   const cudaStream_t* cuda_stream = reinterpret_cast<const cudaStream_t*>(
-      streams_[stream_id]->implementation()->CudaStreamMemberHack());
-  return new ConcretePerOpGpuDevice(cuda_stream, gpu_id_, allocator);
+      streams_[stream_id].compute->implementation()->CudaStreamMemberHack());
+  concrete_device->Reinitialize(cuda_stream, gpu_id_, allocator);
 #endif
 }
 
-const PerOpGpuDevice* BaseGPUDevice::MakeGpuDevice(DeviceContext* dc,
-                                                   Allocator* allocator) {
+PerOpGpuDevice* BaseGPUDevice::MakeGpuDevice() {
+  return new ConcretePerOpGpuDevice();
+}
+
+void BaseGPUDevice::ReinitializeGpuDevice(PerOpGpuDevice* device,
+                                          DeviceContext* dc,
+                                          Allocator* allocator) {
   if (dc) {
     const GPUDeviceContext* gpu_dc = static_cast<GPUDeviceContext*>(dc);
     const int stream_id = gpu_dc->stream_id();
     VLOG(1) << "  eigen_gpu_device(" << dc << ") => stream[" << stream_id
             << "]";
     CHECK_LT(stream_id, streams_.size());
-    return NewDevice(stream_id, allocator);
+    ReinitializeDevice(device, stream_id, allocator);
   } else {
-    return NewDevice(0, allocator);
+    ReinitializeDevice(device, 0, allocator);
   }
 }
 

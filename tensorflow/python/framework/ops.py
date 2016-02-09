@@ -33,6 +33,7 @@ import tensorflow.python.platform
 import six
 from tensorflow.core.framework import attr_value_pb2
 from tensorflow.core.framework import graph_pb2
+from tensorflow.core.framework import versions_pb2
 from tensorflow.python.framework import device as pydev
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import registry
@@ -143,7 +144,7 @@ class Tensor(object):
   d = tf.constant([[1.0, 1.0], [0.0, 1.0]])
   e = tf.matmul(c, d)
 
-  # Construct a `Session` to execut the graph.
+  # Construct a `Session` to execute the graph.
   sess = tf.Session()
 
   # Execute the graph and store the value that `e` represents in `result`.
@@ -783,8 +784,13 @@ class IndexedSlices(object):
         self._indices, self._values,
         (", dense_shape=%s" % self._dense_shape) if self._dense_shape else "")
 
-IndexedSlicesValue = collections.namedtuple("IndexedSlicesValue",
-                                            ["values", "indices", "dense_shape"])
+  def __neg__(self):
+    return IndexedSlices(-self.values, self.indices, self.dense_shape)
+
+
+IndexedSlicesValue = collections.namedtuple(
+    "IndexedSlicesValue", ["values", "indices", "dense_shape"])
+
 
 class SparseTensor(object):
   """Represents a sparse tensor.
@@ -795,7 +801,7 @@ class SparseTensor(object):
   `indices`, `values`, and `shape` tensors, wrap them in a `SparseTensor`
   object before passing to the ops below.
 
-  Concretely, the sparse tensor `SparseTensor(values, indices, shape)` is
+  Concretely, the sparse tensor `SparseTensor(indices, values, shape)` is
 
   * `indices`: A 2-D int64 tensor of shape `[N, ndims]`.
   * `values`: A 1-D tensor of any type and shape `[N]`.
@@ -820,7 +826,7 @@ class SparseTensor(object):
   Example: The sparse tensor
 
   ```python
-  SparseTensor(values=[1, 2], indices=[[0, 0], [1, 2]], shape=[3, 4])
+  SparseTensor(indices=[[0, 0], [1, 2]], values=[1, 2], shape=[3, 4])
   ```
 
   represents the dense tensor
@@ -1129,10 +1135,10 @@ class Operation(object):
 
     Returns:
       The string name of the device to which this op has been
-      assigned, or None if it has not been assigned to a device.
+      assigned, or an empty string if it has not been assigned to a
+      device.
     """
-    dev = self._node_def.device
-    return None if not dev else dev
+    return self._node_def.device
 
   def _set_device(self, device):
     """Set the device of this operation.
@@ -1530,6 +1536,144 @@ def set_shapes_for_outputs(op):
     output.set_shape(s)
 
 
+class OpStats(object):
+  """A holder for statistics about an operator.
+
+  This class holds information about the resource requirements for an op,
+  including the size of its weight parameters on-disk and how many FLOPS it
+  requires to execute forward inference.
+
+  If you define a new operation, you can create a function that will return a
+  set of information about its usage of the CPU and disk space when serialized.
+  The function itself takes a Graph object that's been set up so you can call
+  methods like get_tensor_by_name to help calculate the results, and a NodeDef
+  argument.
+
+  """
+
+  def __init__(self, statistic_type, value=None):
+    """Sets up the initial placeholders for the statistics."""
+    self.statistic_type = statistic_type
+    self.value = value
+
+  @property
+  def statistic_type(self):
+    return self._statistic_type
+
+  @statistic_type.setter
+  def statistic_type(self, statistic_type):
+    self._statistic_type = statistic_type
+
+  @property
+  def value(self):
+    return self._value
+
+  @value.setter
+  def value(self, value):
+    self._value = value
+
+  def __iadd__(self, other):
+    if other.statistic_type != self.statistic_type:
+      raise ValueError("Can't add an OpStat of type %s to one of %s.",
+                       self.statistic_type, other.statistic_type)
+    if self.value is None:
+      self.value = other.value
+    elif other.value is not None:
+      self._value += other.value
+    return self
+
+_stats_registry = registry.Registry("statistical functions")
+
+
+class RegisterStatistics(object):
+  """A decorator for registering the statistics function for an op type.
+
+  This decorator is very similar to the RegisterShapes class, and can be defined
+  for an op type so that it gives a report on the resources used by an instance
+  of an operator, in the form of an OpStats object.
+
+  Well-known types of statistics include these so far:
+
+  - weight_parameters: For operations like MatMul, Conv, and BiasAdd that take
+    learned weights as inputs, this statistic captures how many numerical values
+    are used. This is good to know because the weights take up most of the size
+    of a typical serialized graph on disk.
+
+  - flops: When running a graph, the bulk of the computation happens doing
+    numerical calculations like matrix multiplications. This type allows a node
+    to return how many floating-point operations it takes to complete. The
+    total number of FLOPs for a graph is a good guide to its expected latency.
+
+  You can add your own statistics just by picking a new type string, registering
+  functions for the ops you care about, and then calling something like
+  python/tools/graph_metrics.py with the new type as an argument.
+
+  If a statistic for an op is registered multiple times, a KeyError will be
+  raised.
+
+  For example, you can define a new metric called doohickey for a Foo operation
+  by placing this in your code:
+
+  ```python
+  @ops.RegisterStatistics("Foo", "doohickey")
+  def _calc_foo_bojangles(unused_graph, unused_node_def):
+    return ops.OpStats("doohickey", 20)
+  ```
+
+  Then in client code you can retrieve the value by making this call:
+
+  ```python
+  doohickey = ops.get_stats_for_node_def(graph, node_def, "doohickey")
+  ```
+
+  If the NodeDef is for an op with a registered doohickey function, you'll get
+  back the calculated amount in doohickey.value, or None if it's not defined.
+
+  """
+
+  def __init__(self, op_type, statistic_type):
+    """Saves the `op_type` as the `Operation` type."""
+    if not isinstance(op_type, six.string_types):
+      raise TypeError("op_type must be a string.")
+    if "," in op_type:
+      raise TypeError("op_type must not contain a comma.")
+    self._op_type = op_type
+    if not isinstance(statistic_type, six.string_types):
+      raise TypeError("statistic_type must be a string.")
+    if "," in statistic_type:
+      raise TypeError("statistic_type must not contain a comma.")
+    self._statistic_type = statistic_type
+
+  def __call__(self, f):
+    """Registers "f" as the statistics function for "op_type"."""
+    _stats_registry.register(f, self._op_type + "," + self._statistic_type)
+    return f
+
+
+def get_stats_for_node_def(graph, node, statistic_type):
+  """Looks up the node's statistics function in the registry and calls it.
+
+  This function takes a Graph object and a NodeDef from a GraphDef, and if
+  there's an associated statistics method, calls it and returns a result. If no
+  function has been registered for the particular node type, it returns an empty
+  statistics object.
+
+  Args:
+    graph: A Graph object that's been set up with the node's graph.
+    node: A NodeDef describing the operator.
+    statistic_type: A string identifying the statistic we're interested in.
+  Returns:
+    An OpStats object containing information about resource usage.
+  """
+
+  try:
+    stats_func = _stats_registry.lookup(node.op + "," + statistic_type)
+    result = stats_func(graph, node)
+  except LookupError:
+    result = OpStats(statistic_type)
+  return result
+
+
 class Graph(object):
   """A TensorFlow computation, represented as a dataflow graph.
 
@@ -1593,11 +1737,10 @@ class Graph(object):
   @@get_tensor_by_name
   @@get_operations
 
-  @@get_default_device
   @@seed
   @@unique_name
   @@version
-  @@graph_def_version
+  @@graph_def_versions
 
   @@create_op
   @@gradient_override_map
@@ -1613,8 +1756,6 @@ class Graph(object):
     self._name_stack = ("", "")
     # Maps a name used in the graph to the next id to use for that name.
     self._names_in_use = {}
-    # Default device applied to new ops.
-    self._default_device = None
     # Functions that will be applied to choose a device if none is specified.
     self._device_function_stack = []
     # Default original_op applied to new ops.
@@ -1638,8 +1779,10 @@ class Graph(object):
     self._finalized = False
     # Functions defined in the graph
     self._functions = collections.OrderedDict()
-    # Default GraphDef version
-    self._graph_def_version = versions.GRAPH_DEF_VERSION
+    # Default GraphDef versions
+    self._graph_def_versions = versions_pb2.VersionDef(
+        producer=versions.GRAPH_DEF_VERSION,
+        min_consumer=versions.GRAPH_DEF_VERSION_MIN_CONSUMER)
 
   def _check_not_finalized(self):
     """Check if the graph is finalized.
@@ -1683,27 +1826,16 @@ class Graph(object):
     return self._next_id_counter
 
   @property
-  def graph_def_version(self):
-    """The GraphDef version of this graph.
+  def graph_def_versions(self):
+    """The GraphDef version information of this graph.
 
     For details on the meaning of each version, see [`GraphDef`]
     (https://www.tensorflow.org/code/tensorflow/core/framework/graph.proto).
-    """
-    return self._graph_def_version
 
-  @graph_def_version.setter
-  def graph_def_version(self, version):
-    if not (versions.GRAPH_DEF_VERSION_MIN <= version <=
-            versions.GRAPH_DEF_VERSION_MAX):
-      low = version < versions.GRAPH_DEF_VERSION_MIN
-      raise ValueError(
-          "GraphDef version %d is %s supported: TensorFlow %s needs %d <= "
-          "version <= %d.  Please %s." %
-          (version, "no longer" if low else "not yet",
-           versions.__version__, versions.GRAPH_DEF_VERSION_MIN,
-           versions.GRAPH_DEF_VERSION_MAX,
-           "regenerate your graph" if low else "upgrade TensorFlow"))
-    self._graph_def_version = version
+    Returns:
+      A `VersionDef`.
+    """
+    return self._graph_def_versions
 
   @property
   def seed(self):
@@ -1766,7 +1898,7 @@ class Graph(object):
       ValueError: If the `graph_def` would be too large.
     """
     graph = graph_pb2.GraphDef()
-    graph.version = self._graph_def_version
+    graph.versions.CopyFrom(self._graph_def_versions)
     bytesize = 0
     for op_id in sorted(self._nodes_by_id):
       op = self._nodes_by_id[op_id]
@@ -1878,8 +2010,7 @@ class Graph(object):
     else:
       name = self.unique_name(name)
 
-    node_def = _NodeDef(
-        op_type, name, device=self._default_device or None, attrs=attrs)
+    node_def = _NodeDef(op_type, name, device=None, attrs=attrs)
 
     # Apply a kernel label if one has been specified for this op_type.
     try:
@@ -1911,6 +2042,8 @@ class Graph(object):
     # We apply here because the result can depend on the Operation's
     # signature, which is computed in the Operation constructor.
     for device_function in reversed(self._device_function_stack):
+      if device_function is None:
+        break
       ret._set_device(device_function(ret))
     return ret
 
@@ -2133,8 +2266,11 @@ class Graph(object):
   def add_to_collection(self, name, value):
     """Stores `value` in the collection with the given `name`.
 
+    Note that collections are not sets, so it is possible to add a value to
+    a collection several times.
+
     Args:
-      name: The key for the collection. For example, the `GraphKeys` class
+      name: The key for the collection. The `GraphKeys` class
         contains many standard names for collections.
       value: The value to add to the collection.
     """
@@ -2144,11 +2280,27 @@ class Graph(object):
     else:
       self._collections[name].append(value)
 
+  def add_to_collections(self, names, value):
+    """Stores `value` in the collections given by `names`.
+
+    Note that collections are not sets, so it is possible to add a value to
+    a collection several times. This function makes sure that duplicates in
+    `names` are ignored, but it will not check for pre-existing membership of
+    `value` in any of the collections in `names`.
+
+    Args:
+      names: The keys for the collections to add to. The `GraphKeys` class
+        contains many standard names for collections.
+      value: The value to add to the collections.
+    """
+    for name in set(names):
+      self.add_to_collection(name, value)
+
   def get_collection(self, name, scope=None):
     """Returns a list of values in the collection with the given `name`.
 
     Args:
-      key: The key for the collection. For example, the `GraphKeys` class
+      name: The key for the collection. For example, the `GraphKeys` class
         contains many standard names for collections.
       scope: (Optional.) If supplied, the resulting list is filtered to include
         only items whose name begins with this string.
@@ -2167,6 +2319,10 @@ class Graph(object):
         if hasattr(item, "name") and item.name.startswith(scope):
           c.append(item)
       return c
+
+  def get_all_collection_keys(self):
+    """Returns a list of collections used in this graph."""
+    return [x for x in self._collections if isinstance(x, (str, unicode))]
 
   @contextlib.contextmanager
   def _original_op(self, op):
@@ -2218,34 +2374,34 @@ class Graph(object):
     ```python
     with tf.Graph().as_default() as g:
       c = tf.constant(5.0, name="c")
-      assert c_1.name == "c"
+      assert c.op.name == "c"
       c_1 = tf.constant(6.0, name="c")
-      assert c_1.name == "c_1"
+      assert c_1.op.name == "c_1"
 
       # Creates a scope called "nested"
       with g.name_scope("nested") as scope:
         nested_c = tf.constant(10.0, name="c")
-        assert nested_c.name == "nested/c"
+        assert nested_c.op.name == "nested/c"
 
         # Creates a nested scope called "inner".
         with g.name_scope("inner"):
           nested_inner_c = tf.constant(20.0, name="c")
-          assert nested_inner_c.name == "nested/inner/c"
+          assert nested_inner_c.op.name == "nested/inner/c"
 
         # Create a nested scope called "inner_1".
         with g.name_scope("inner"):
           nested_inner_1_c = tf.constant(30.0, name="c")
-          assert nested_inner_1_c.name == "nested/inner_1/c"
+          assert nested_inner_1_c.op.name == "nested/inner_1/c"
 
           # Treats `scope` as an absolute name scope, and
           # switches to the "nested/" scope.
           with g.name_scope(scope):
             nested_d = tf.constant(40.0, name="d")
-            assert nested_d.name == "nested/d"
+            assert nested_d.op.name == "nested/d"
 
             with g.name_scope(""):
               e = tf.constant(50.0, name="e")
-              assert e.name == "e"
+              assert e.op.name == "e"
     ```
 
     The name of the scope itself can be captured by `with
@@ -2262,7 +2418,6 @@ class Graph(object):
       affine = tf.matmul(inputs, weights) + biases
       output = tf.nn.relu(affine, name=scope)
     ```
-
 
     Args:
       name: A name for the scope.
@@ -2336,54 +2491,6 @@ class Graph(object):
     else:
       return name
 
-  def _set_default_device(self, dev):
-    """Set the default device properties.
-
-    Args:
-      dev: string or Device.
-    """
-    self._default_device = _device_string(dev)
-
-  def get_default_device(self):
-    """Returns the default device.
-
-    Returns:
-      A string.
-    """
-    return self._default_device
-
-  def _push_default_device_function(self, device_function):
-    """Pushes the given function onto the stack of device functions.
-
-    See `Graph.device` for more details.
-
-    Args:
-      device_function: The function to be pushed onto the stack of device
-        functions.
-    """
-    self._device_function_stack.append(device_function)
-
-  def _pop_default_device_function(self, device_function):
-    """Pops the given function from the stack of device functions.
-
-    See `Graph.device` for more details.
-
-    Args:
-      device_function: The function to be popped from the stack of device
-        functions.
-
-    Raises:
-      ValueError: if the device_function to be popped is not top of the stack,
-        or if the stack is empty.
-    """
-    if not self._device_function_stack:
-      raise ValueError("Tried to pop, but the device function stack is empty")
-    if self._device_function_stack[-1] is not device_function:
-      raise ValueError("Tried to pop device function, but it was not on top "
-                       "of the stack")
-
-    self._device_function_stack.pop()
-
   @contextlib.contextmanager
   def device(self, device_name_or_function):
     """Returns a context manager that specifies the default device to use.
@@ -2392,12 +2499,14 @@ class Graph(object):
     string, a device function, or None:
 
     * If it is a device name string, all operations constructed in
-      this context will be assigned to the device with that name.
+      this context will be assigned to the device with that name, unless
+      overridden by a nested `device()` context.
     * If it is a function, it will be treated as function from
       Operation objects to device name strings, and invoked each time
       a new Operation is created. The Operation will be assigned to
       the device with the returned name.
-    * If it is None, the default device will be cleared.
+    * If it is None, all `device()` invocations from the enclosing context
+      will be ignored.
 
     For example:
 
@@ -2430,19 +2539,17 @@ class Graph(object):
       A context manager that specifies the default device to use for newly
       created ops.
     """
-    if callable(device_name_or_function):
-      try:
-        self._push_default_device_function(device_name_or_function)
-        yield
-      finally:
-        self._pop_default_device_function(device_name_or_function)
+    if (device_name_or_function is not None
+        and not callable(device_name_or_function)):
+      device_function = pydev.merge_device(device_name_or_function)
     else:
-      try:
-        old_dev = self.get_default_device()
-        self._set_default_device(_device_string(device_name_or_function))
-        yield
-      finally:
-        self._set_default_device(old_dev)
+      device_function = device_name_or_function
+
+    try:
+      self._device_function_stack.append(device_function)
+      yield
+    finally:
+      self._device_function_stack.pop()
 
   class _ControlDependenciesController(object):
     """Context manager for `control_dependencies()`."""
@@ -3204,8 +3311,17 @@ class GraphKeys(object):
   ASSET_FILEPATHS = "asset_filepaths"
   # Key to collect Variable objects that keep moving averages.
   MOVING_AVERAGE_VARIABLES = "moving_average_variables"
-  # Key to collected regularization losses at graph construction.
+  # Key to collect regularization losses at graph construction.
   REGULARIZATION_LOSSES = "regularization_losses"
+  # Key to collect concatenated sharded variables.
+  CONCATENATED_VARIABLES = "concatenated_variables"
+  # Key to collect savers.
+  SAVERS = "savers"
+
+  # Key to indicate various ops.
+  INIT_OP = "init_op"
+  READY_OP = "ready_op"
+  GLOBAL_STEP = "global_step"
 
 
 def add_to_collection(name, value):
@@ -3220,6 +3336,20 @@ def add_to_collection(name, value):
     value: The value to add to the collection.
   """
   get_default_graph().add_to_collection(name, value)
+
+
+def add_to_collections(names, value):
+  """Wrapper for `Graph.add_to_collections()` using the default graph.
+
+  See [`Graph.add_to_collections()`](../../api_docs/python/framework.md#Graph.add_to_collections)
+  for more details.
+
+  Args:
+    names: The key for the collections. The `GraphKeys` class
+      contains many standard names for collections.
+    value: The value to add to the collections.
+  """
+  get_default_graph().add_to_collections(names, value)
 
 
 def get_collection(key, scope=None):
@@ -3241,6 +3371,11 @@ def get_collection(key, scope=None):
     collected.
   """
   return get_default_graph().get_collection(key, scope)
+
+
+def get_all_collection_keys():
+  """Returns a list of collections used in the default graph."""
+  return get_default_graph().get_all_collection_keys()
 
 
 # pylint: disable=g-doc-return-or-yield
@@ -3284,3 +3419,56 @@ def op_scope(values, name, default_name=None):
   with g.as_default(), g.name_scope(n) as scope:
     yield scope
 # pylint: enable=g-doc-return-or-yield
+
+
+_proto_function_registry = registry.Registry("proto functions")
+
+
+def register_proto_function(collection_name, proto_type=None, to_proto=None,
+                            from_proto=None):
+  """Registers `to_proto` and `from_proto` functions for collection_name.
+
+  `to_proto` function converts a Python object to the corresponding protocol
+  buffer, and returns the protocol buffer.
+
+  `from_proto` function converts protocol buffer into a Python object, and
+  returns the object..
+
+  Args:
+    collection_name: Name of the collection.
+    proto_type: Protobuf type, such as `saver_pb2.SaverDef`,
+      `variable_pb2.VariableDef`, `queue_runner_pb2.QueueRunnerDef`..
+    to_proto: Function that implements Python object to protobuf conversion.
+    from_proto: Function that implements protobuf to Python object conversion.
+  """
+  if to_proto and not callable(to_proto):
+    raise TypeError("to_proto must be callable.")
+  if from_proto and not callable(from_proto):
+    raise TypeError("from_proto must be callable.")
+
+  _proto_function_registry.register((proto_type, to_proto, from_proto),
+                                    collection_name)
+
+
+def get_collection_proto_type(collection_name):
+  """Returns the proto_type for collection_name."""
+  try:
+    return _proto_function_registry.lookup(collection_name)[0]
+  except LookupError:
+    return None
+
+
+def get_to_proto_function(collection_name):
+  """Returns the to_proto function for collection_name."""
+  try:
+    return _proto_function_registry.lookup(collection_name)[1]
+  except LookupError:
+    return None
+
+
+def get_from_proto_function(collection_name):
+  """Returns the from_proto function for collection_name."""
+  try:
+    return _proto_function_registry.lookup(collection_name)[2]
+  except LookupError:
+    return None

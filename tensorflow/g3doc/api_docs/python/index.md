@@ -92,6 +92,7 @@
   * [`reverse`](../../api_docs/python/array_ops.md#reverse)
   * [`reverse_sequence`](../../api_docs/python/array_ops.md#reverse_sequence)
   * [`shape`](../../api_docs/python/array_ops.md#shape)
+  * [`shape_n`](../../api_docs/python/array_ops.md#shape_n)
   * [`size`](../../api_docs/python/array_ops.md#size)
   * [`slice`](../../api_docs/python/array_ops.md#slice)
   * [`split`](../../api_docs/python/array_ops.md#split)
@@ -104,6 +105,7 @@
   * [`to_int32`](../../api_docs/python/array_ops.md#to_int32)
   * [`to_int64`](../../api_docs/python/array_ops.md#to_int64)
   * [`transpose`](../../api_docs/python/array_ops.md#transpose)
+  * [`unique_with_counts`](../../api_docs/python/array_ops.md#unique_with_counts)
   * [`unpack`](../../api_docs/python/array_ops.md#unpack)
 
 * **[Math](../../api_docs/python/math_ops.md)**:
@@ -118,6 +120,7 @@
   * [`batch_matrix_determinant`](../../api_docs/python/math_ops.md#batch_matrix_determinant)
   * [`batch_matrix_inverse`](../../api_docs/python/math_ops.md#batch_matrix_inverse)
   * [`batch_matrix_solve`](../../api_docs/python/math_ops.md#batch_matrix_solve)
+  * [`batch_matrix_solve_ls`](../../api_docs/python/math_ops.md#batch_matrix_solve_ls)
   * [`batch_matrix_triangular_solve`](../../api_docs/python/math_ops.md#batch_matrix_triangular_solve)
   * [`batch_self_adjoint_eig`](../../api_docs/python/math_ops.md#batch_self_adjoint_eig)
   * [`ceil`](../../api_docs/python/math_ops.md#ceil)
@@ -146,6 +149,7 @@
   * [`matrix_determinant`](../../api_docs/python/math_ops.md#matrix_determinant)
   * [`matrix_inverse`](../../api_docs/python/math_ops.md#matrix_inverse)
   * [`matrix_solve`](../../api_docs/python/math_ops.md#matrix_solve)
+  * [`matrix_solve_ls`](../../api_docs/python/math_ops.md#matrix_solve_ls)
   * [`matrix_triangular_solve`](../../api_docs/python/math_ops.md#matrix_triangular_solve)
   * [`maximum`](../../api_docs/python/math_ops.md#maximum)
   * [`minimum`](../../api_docs/python/math_ops.md#minimum)
@@ -265,6 +269,7 @@
   * [`batch`](../../api_docs/python/io_ops.md#batch)
   * [`batch_join`](../../api_docs/python/io_ops.md#batch_join)
   * [`decode_csv`](../../api_docs/python/io_ops.md#decode_csv)
+  * [`decode_json_example`](../../api_docs/python/io_ops.md#decode_json_example)
   * [`decode_raw`](../../api_docs/python/io_ops.md#decode_raw)
   * [`FIFOQueue`](../../api_docs/python/io_ops.md#FIFOQueue)
   * [`FixedLenFeature`](../../api_docs/python/io_ops.md#FixedLenFeature)
@@ -327,6 +332,7 @@
   * [`softmax_cross_entropy_with_logits`](../../api_docs/python/nn.md#softmax_cross_entropy_with_logits)
   * [`softplus`](../../api_docs/python/nn.md#softplus)
   * [`softsign`](../../api_docs/python/nn.md#softsign)
+  * [`sparse_softmax_cross_entropy_with_logits`](../../api_docs/python/nn.md#sparse_softmax_cross_entropy_with_logits)
   * [`tanh`](../../api_docs/python/nn.md#tanh)
   * [`top_k`](../../api_docs/python/nn.md#top_k)
   * [`uniform_candidate_sampler`](../../api_docs/python/nn.md#uniform_candidate_sampler)
@@ -366,6 +372,7 @@
   * [`exponential_decay`](../../api_docs/python/train.md#exponential_decay)
   * [`ExponentialMovingAverage`](../../api_docs/python/train.md#ExponentialMovingAverage)
   * [`FtrlOptimizer`](../../api_docs/python/train.md#FtrlOptimizer)
+  * [`generate_checkpoint_state_proto`](../../api_docs/python/train.md#generate_checkpoint_state_proto)
   * [`global_norm`](../../api_docs/python/train.md#global_norm)
   * [`global_step`](../../api_docs/python/train.md#global_step)
   * [`GradientDescentOptimizer`](../../api_docs/python/train.md#GradientDescentOptimizer)
@@ -379,6 +386,7 @@
   * [`Optimizer`](../../api_docs/python/train.md#Optimizer)
   * [`QueueRunner`](../../api_docs/python/train.md#QueueRunner)
   * [`RMSPropOptimizer`](../../api_docs/python/train.md#RMSPropOptimizer)
+  * [`SaverDef`](../../api_docs/python/train.md#SaverDef)
   * [`scalar_summary`](../../api_docs/python/train.md#scalar_summary)
   * [`start_queue_runners`](../../api_docs/python/train.md#start_queue_runners)
   * [`stop_gradient`](../../api_docs/python/train.md#stop_gradient)
@@ -389,4 +397,8 @@
 
 * **[Wraps python functions](../../api_docs/python/script_ops.md)**:
   * [`py_func`](../../api_docs/python/script_ops.md#py_func)
+
+* **[Unsupported](../../api_docs/python/unsupported.md)**:
+  * [`constant_value`](../../api_docs/python/unsupported.md#constant_value)
+  * [`make_all`](../../api_docs/python/unsupported.md#make_all)
 

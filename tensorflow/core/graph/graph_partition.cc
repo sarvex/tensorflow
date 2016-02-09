@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <deque>
 #include <unordered_map>
+#include <vector>
 
 #include "tensorflow/core/framework/node_def_builder.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -642,7 +643,7 @@ Status BuildMemoryDeviceInfo(const Graph& g, GraphInfo* info) {
     input_memory_types.resize(node->num_inputs());
     output_memory_types.clear();
     output_memory_types.resize(node->num_outputs());
-    status = MemoryTypesForNode(g.op_registry(), DeviceType(parsed.type),
+    status = MemoryTypesForNode(*g.op_registry(), DeviceType(parsed.type),
                                 node->def(), &input_memory_types,
                                 &output_memory_types);
     if (!status.ok()) return status;
@@ -1101,7 +1102,7 @@ Status Partition(const PartitionOptions& opts, Graph* g,
 
   // Set versions
   for (auto& it : *partitions) {
-    it.second.set_version(g->version());
+    it.second.mutable_versions()->CopyFrom(g->versions());
   }
 
   // Set the start times for recvs at the very end.

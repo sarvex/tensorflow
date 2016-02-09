@@ -24,7 +24,7 @@ limitations under the License.
 #include "tensorflow/core/framework/numeric_types.h"
 #include "tensorflow/core/framework/type_traits.h"
 #include "tensorflow/core/platform/logging.h"
-#include "tensorflow/core/platform/port.h"
+#include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
 
@@ -107,6 +107,12 @@ class Allocator {
   // RequestedSize and AllocatedSize must be overridden if
   // TracksAlloctionSizes is overridden to return true.
   virtual bool TracksAllocationSizes() { return false; }
+
+  // Returns true if this allocator requires tensors with 0 elements
+  // to allocate buffers. This is false for most allocators, but may
+  // be used by special-case allocators that want to track tensor
+  // usage.
+  virtual bool ShouldAllocateEmptyTensors() { return false; }
 
   // Returns the user-requested size of the data allocated at
   // 'ptr'.  Note that the actual buffer allocated might be larger

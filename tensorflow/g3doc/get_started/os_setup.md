@@ -303,14 +303,16 @@ $ git clone --recurse-submodules https://github.com/tensorflow/tensorflow
 ```
 
 `--recurse-submodules` is required to fetch the protobuf library that TensorFlow
-depends on.
+depends on. Note that these instructions will install the latest master branch
+of tensorflow. If you want to install a specific branch (such as a release branch),
+pass `-b <branchname>` to the `git clone` command.
 
 ### Installation for Linux
 
 #### Install Bazel
 
 Follow instructions [here](http://bazel.io/docs/install.html) to install the
-dependencies for Bazel. Then download the latest stable bazel version using the
+dependencies for bazel. Then download the latest stable bazel version using the
 [installer for your system](https://github.com/bazelbuild/bazel/releases) and
 run the installer as mentioned there:
 
@@ -448,10 +450,33 @@ Setting up Cuda nvvm
 Configuration finished
 ```
 
+##### Using a different Cuda SDK and Cudnn versions
+TensorFlow officially supports Cuda 7.0 and Cudnn V2 (6.5) at this point. In
+order to use a different Cuda SDK or Cudnn libraries, use the unofficial setting
+with "configure"
+
+```bash
+$ TF_UNOFFICIAL_SETTING=1 ./configure
+...
+Please specify the Cuda SDK version you want to use. [Default is 7.0]: 7.5
+Please specify the location where CUDA 7.5 toolkit is installed. Refer to README.md for more details. [Default is /usr/local/cuda]: /usr/local/cuda-7.5
+Please specify the Cudnn version you want to use. [Default is 6.5]: 4.0.4
+Please specify the location where cuDNN 4.0.4 library is installed. Refer to README.md for more details. [Default is /usr/local/cuda-7.5]: /usr/local/cudnn-r4-rc/
+...
+Setting up Cuda include
+Setting up Cuda lib64
+Setting up Cuda bin
+Setting up Cuda nvvm
+Configuration finished
+```
+
+For the Cudnn libraries, use '6.5' for R2, '7.0' for R3, and '4.0.4' for
+R4-RC.
+
 ##### Known issues
 
 * Although it is possible to build both Cuda and non-Cuda configs under the same
-source tree, we recommend to run "bazel clean" when switching between these two
+source tree, we recommend to run `bazel clean` when switching between these two
 configs in the same source tree.
 
 * You have to run configure before running bazel build. Otherwise, the build
@@ -470,7 +495,7 @@ case, be sure to install its dependency [PCRE](from www.pcre.org) and not PCRE2.
 #### Dependencies
 
 Follow instructions [here](http://bazel.io/docs/install.html) to install the
-dependencies for Bazel. You can then use homebrew to install bazel and SWIG:
+dependencies for bazel. You can then use homebrew to install bazel and SWIG:
 
 ```bash
 $ brew install bazel swig
@@ -507,6 +532,8 @@ Do you wish to build TensorFlow with GPU support? [y/N]
 
 ### Create the pip package and install
 
+When building from source, you will still build a pip package and install that.
+
 ```bash
 $ bazel build -c opt //tensorflow/tools/pip_package:build_pip_package
 
@@ -518,6 +545,29 @@ $ bazel-bin/tensorflow/tools/pip_package/build_pip_package /tmp/tensorflow_pkg
 # The name of the .whl file will depend on your platform.
 $ pip install /tmp/tensorflow_pkg/tensorflow-0.6.0-cp27-none-linux_x86_64.whl
 ```
+
+## Setting up TensorFlow for Development
+
+If you're working on TensorFlow itself, it is useful to be able to test your
+changes in an interactive python shell without having to reinstall TensorFlow.
+
+To set up TensorFlow such that all files are linked (instead of copied) from the
+system directories, run the following commands inside the TensorFlow root
+directory:
+
+```bash
+bazel build -c opt //tensorflow/tools/pip_package:build_pip_package
+mkdir _python_build
+cd _python_build
+ln -s ../bazel-bin/tensorflow/tools/pip_package/build_pip_package.runfiles/* .
+ln -s ../tensorflow/tools/pip_package/* .
+python setup.py develop
+```
+
+Note that this setup still requires you to rebuild the
+`//tensorflow/tools/pip_package:build_pip_package` target every time you change
+a C++ file; add, delete, or move any python file; or if you change bazel build
+rules.
 
 ## Train your first TensorFlow neural net model
 
@@ -547,29 +597,6 @@ Validation error: 7.0%
 ...
 ```
 
-## Setting up TensorFlow for Development
-
-If you're working on TensorFlow itself, it is useful to be able to test your
-changes in an interactive python shell without having to reinstall TensorFlow.
-
-To set up TensorFlow such that all files are linked (instead of copied) from the
-system directories, run the following commands inside the TensorFlow root
-directory:
-
-```bash
-bazel build -c opt //tensorflow/tools/pip_package:build_pip_package
-mkdir _python_build
-cd _python_build
-ln -s ../bazel-bin/tensorflow/tools/pip_package/build_pip_package.runfiles/* .
-ln -s ../tensorflow/tools/pip_package/* .
-python setup.py develop
-```
-
-Note that this setup still requires you to rebuild the
-`//tensorflow/tools/pip_package:build_pip_package` target every time you change
-a C++ file; add, delete, or move any python file; or if you change bazel build
-rules.
-
 ## Common Problems
 
 ### GPU-related issues
@@ -580,7 +607,7 @@ If you encounter the following when trying to run a TensorFlow program:
 ImportError: libcudart.so.7.0: cannot open shared object file: No such file or directory
 ```
 
-Make sure you followed the the GPU installation [instructions](#optional-install-cuda-gpus-on-linux).
+Make sure you followed the GPU installation [instructions](#optional-install-cuda-gpus-on-linux).
 
 ### Pip installation issues
 

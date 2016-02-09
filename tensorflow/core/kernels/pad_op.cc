@@ -27,12 +27,12 @@ limitations under the License.
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
+#include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/tensor_types.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/platform/logging.h"
-#include "tensorflow/core/platform/port.h"
-#include "tensorflow/core/public/tensor.h"
-#include "tensorflow/core/public/tensor_shape.h"
+#include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
 
@@ -72,7 +72,7 @@ class PadOp : public OpKernel {
     TTypes<int32>::ConstMatrix paddings = in1.matrix<int32>();
     for (int d = 0; d < fixed_dims; ++d) {
       const int32 before_d = paddings(d, 0);  // Pad before existing elements.
-      const int32 after_d = paddings(d, 1);   // Pad after exisitng elements.
+      const int32 after_d = paddings(d, 1);   // Pad after existing elements.
       OP_REQUIRES(context, before_d >= 0 && after_d >= 0,
                   errors::InvalidArgument("Paddings must be non-negative: ",
                                           before_d, " ", after_d));
