@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,12 +13,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_KERNELS_XENT_OP_H_
-#define TENSORFLOW_KERNELS_XENT_OP_H_
+#ifndef TENSORFLOW_CORE_KERNELS_SPARSE_XENT_OP_H_
+#define TENSORFLOW_CORE_KERNELS_SPARSE_XENT_OP_H_
 // Functor definition for SparseXentOp, must be compilable by nvcc.
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "tensorflow/core/framework/bounds_check.h"
+#include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor_types.h"
+#include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
@@ -50,67 +53,104 @@ namespace generator {
 //
 // for j = 0 .. num_classes.  This value must be summed over all j for
 // the final loss.
-template <typename T>
+template <typename T, typename Index>
 class SparseXentLossGenerator {
  public:
   EIGEN_DEVICE_FUNC EIGEN_ALWAYS_INLINE SparseXentLossGenerator(
       typename TTypes<const T, 2>::Tensor32Bit logits,
       typename TTypes<const T, 1>::Tensor32Bit sum_exp_logits,
-      TTypes<const int64, 1>::Tensor32Bit labels)
-      : logits_(logits), sum_exp_logits_(sum_exp_logits), labels_(labels) {}
+      typename TTypes<const Index, 1>::Tensor32Bit labels,
+      const Index max_depth)
+      : logits_(logits),
+        sum_exp_logits_(sum_exp_logits),
+        labels_(labels),
+        max_depth_(max_depth) {}
 
   EIGEN_DEVICE_FUNC EIGEN_ALWAYS_INLINE T
   operator()(const Eigen::array<int, 2>& coords) const {
-    int batch = coords[0];
-    int depth = coords[1];
-    return (labels_(batch) == depth)
-               ? (std::log(sum_exp_logits_(batch)) - logits_(coords))
+    const int batch = coords[0];
+    const int depth = coords[1];
+    const Index label = tensorflow::internal::SubtleMustCopy(labels_(batch));
+    if (!FastBoundsCheck(label, max_depth_)) {
+      return Eigen::NumTraits<T>::quiet_NaN();
+    }
+    return TF_PREDICT_FALSE(label == depth)
+               ? (Eigen::numext::log(sum_exp_logits_(batch)) - logits_(coords))
                : T(0.0);
   };
 
  private:
   typename TTypes<const T, 2>::Tensor32Bit logits_;
   typename TTypes<const T, 1>::Tensor32Bit sum_exp_logits_;
-  TTypes<const int64, 1>::Tensor32Bit labels_;
+  typename TTypes<const Index, 1>::Tensor32Bit labels_;
+  const Index max_depth_;
 };
 
 // Generator for calculation of the sparse Xent gradient.
-// This generator takes the logits, the sum of the exponentiated
-// logits, and the label indices.  For each minibatch entry, ignoring
-// the batch index b, it calculates:
+// This generator takes the exponentiated logits, their sums, and the label
+// indices. For each minibatch entry, ignoring the batch index b, it calculates:
 //
-//   exp(logits[j]) / sum_exp_logits - 1{ j == label }
+//   exp_logits[j] / sum_exp_logits - 1{ j == label }
 //
 // for j = 0 .. num_classes.
-template <typename T>
+template <typename T, typename Index>
 class SparseXentGradGenerator {
  public:
   EIGEN_DEVICE_FUNC EIGEN_ALWAYS_INLINE SparseXentGradGenerator(
-      typename TTypes<const T, 2>::Tensor32Bit logits,
+      typename TTypes<const T, 2>::Tensor32Bit exp_logits,
       typename TTypes<const T, 1>::Tensor32Bit sum_exp_logits,
-      TTypes<const int64, 1>::Tensor32Bit labels)
-      : logits_(logits), sum_exp_logits_(sum_exp_logits), labels_(labels) {}
+      typename TTypes<const Index, 1>::Tensor32Bit labels,
+      const Index max_depth)
+      : exp_logits_(exp_logits),
+        sum_exp_logits_(sum_exp_logits),
+        labels_(labels),
+        max_depth_(max_depth) {}
 
   EIGEN_DEVICE_FUNC EIGEN_ALWAYS_INLINE T
   operator()(const Eigen::array<int, 2>& coords) const {
-    int batch = coords[0];
-    int depth = coords[1];
-    T subtract = (depth == labels_(batch)) ? T(1.0) : T(0.0);
-    return std::exp(logits_(coords)) / sum_exp_logits_(batch) - subtract;
+    const int batch = coords[0];
+    const int depth = coords[1];
+    const Index label = tensorflow::internal::SubtleMustCopy(labels_(batch));
+    if (!FastBoundsCheck(label, max_depth_)) {
+      return Eigen::NumTraits<T>::quiet_NaN();
+    }
+    T subtract = TF_PREDICT_FALSE(depth == label) ? T(1.0) : T(0.0);
+    return exp_logits_(coords) / sum_exp_logits_(batch) - subtract;
   };
 
  private:
-  typename TTypes<const T, 2>::Tensor32Bit logits_;
+  typename TTypes<const T, 2>::Tensor32Bit exp_logits_;
   typename TTypes<const T, 1>::Tensor32Bit sum_exp_logits_;
-  TTypes<const int64, 1>::Tensor32Bit labels_;
+  typename TTypes<const Index, 1>::Tensor32Bit labels_;
+  const Index max_depth_;
 };
 
 }  // namespace generator
 
 namespace functor {
 
-// Functor used by SparseXentOp to do the computations.
 template <typename Device, typename T>
+struct RowMaxReduction {
+  // Computes the maximum across the rows of logits
+  //
+  // logits: batch_size, num_classes.
+  // maximum: temporary tensor, dims: batch_size, 1
+  static inline void Compute(OpKernelContext* ctx,
+                             typename TTypes<T>::ConstMatrix logits,
+                             typename TTypes<T>::Vec maximum) {
+#if !defined(EIGEN_HAS_INDEX_LIST)
+    Eigen::array<int, 1> along_row;
+    along_row[0] = 1;
+#else
+    Eigen::IndexList<Eigen::type2index<1> > along_row;
+#endif
+    Device d = ctx->eigen_device<Device>();
+    To32Bit(maximum).device(d) = To32Bit(logits).maximum(along_row);
+  }
+};
+
+// Functor used by SparseXentOp to do the computations.
+template <typename Device, typename T, typename Index>
 struct SparseXentFunctor {
   // Computes Cross Entropy loss and backprop.
   //
@@ -119,8 +159,8 @@ struct SparseXentFunctor {
   // scratch: temporary tensor, dims: batch_size, 1
   // loss: output tensor for the loss, dims: batch_size.
   // backprop: output tensor for the backprop, dims: batch_size, num_classes.
-  void operator()(const Device& d, typename TTypes<T>::ConstMatrix logits,
-                  typename TTypes<int64>::ConstVec labels,
+  void operator()(OpKernelContext* ctx, typename TTypes<T>::ConstMatrix logits,
+                  typename TTypes<Index>::ConstVec labels,
                   typename TTypes<T>::Vec scratch, typename TTypes<T>::Vec loss,
                   typename TTypes<T>::Matrix backprop);
 };
@@ -128,10 +168,11 @@ struct SparseXentFunctor {
 // Eigen code implementing SparseXentFunctor::operator().
 // This code works for both CPU and GPU and is used by the functor
 // specializations for both device types.
-template <typename Device, typename T>
+template <typename Device, typename T, typename Index>
 struct SparseXentEigenImpl {
-  static void Compute(const Device& d, typename TTypes<T>::ConstMatrix logits,
-                      typename TTypes<int64>::ConstVec labels,
+  static void Compute(OpKernelContext* ctx,
+                      typename TTypes<T>::ConstMatrix logits,
+                      typename TTypes<Index>::ConstVec labels,
                       typename TTypes<T>::Vec scratch,
                       typename TTypes<T>::Vec loss,
                       typename TTypes<T>::Matrix backprop) {
@@ -169,8 +210,9 @@ struct SparseXentEigenImpl {
 #endif
 
     // scratch = max_logits along classes.
-    To32Bit(scratch).device(d) = To32Bit(logits).maximum(along_class);
+    RowMaxReduction<Device, T>::Compute(ctx, logits, scratch);
 
+    Device d = ctx->eigen_device<Device>();
     // backprop = logits - max_logits.
     To32Bit(backprop).device(d) =
         To32Bit(logits) -
@@ -182,17 +224,20 @@ struct SparseXentEigenImpl {
     //  sum(-labels *
     //     ((logits - max_logits) - log(sum(exp(logits - max_logits)))))
     //  along classes
-    generator::SparseXentLossGenerator<T> sparse_xent_loss_gen(
+    generator::SparseXentLossGenerator<T, Index> sparse_xent_loss_gen(
         sparse_xent_helpers::To32BitConst<T>(backprop),
-        sparse_xent_helpers::To32BitConst<T>(scratch), To32Bit(labels));
+        sparse_xent_helpers::To32BitConst<T>(scratch), To32Bit(labels),
+        backprop.dimension(1) /* max_depth */);
     To32Bit(loss).device(d) =
         To32Bit(backprop).generate(sparse_xent_loss_gen).sum(along_class);
 
     // backprop: prob - labels, where
     //   prob = exp(logits - max_logits) / sum(exp(logits - max_logits))
-    generator::SparseXentGradGenerator<T> sparse_xent_grad_gen(
+    To32Bit(backprop).device(d) = To32Bit(backprop).exp();
+    generator::SparseXentGradGenerator<T, Index> sparse_xent_grad_gen(
         sparse_xent_helpers::To32BitConst<T>(backprop),
-        sparse_xent_helpers::To32BitConst<T>(scratch), To32Bit(labels));
+        sparse_xent_helpers::To32BitConst<T>(scratch), To32Bit(labels),
+        backprop.dimension(1) /* max_depth */);
     To32Bit(backprop).device(d) =
         To32Bit(backprop).generate(sparse_xent_grad_gen);
   }
@@ -202,4 +247,4 @@ struct SparseXentEigenImpl {
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_KERNELS_XENT_OP_H_
+#endif  // TENSORFLOW_CORE_KERNELS_SPARSE_XENT_OP_H_
